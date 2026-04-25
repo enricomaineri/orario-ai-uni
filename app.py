@@ -191,10 +191,11 @@ def get_orario(
 
 # ========= FRONTEND =========
 
+BASE_DIR = Path(__file__).resolve().parent
 
 @app.get("/", response_class=HTMLResponse)
 def read_root():
-    index_path = Path("public/index.html")
+    index_path = BASE_DIR / "public" / "index.html"
     if not index_path.exists():
         return HTMLResponse("<h1>Manca public/index.html</h1>", status_code=500)
     return index_path.read_text(encoding="utf-8")
