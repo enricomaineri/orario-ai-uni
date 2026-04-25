@@ -6,7 +6,6 @@ import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # ========= CONFIG =========
@@ -49,9 +48,6 @@ class OrarioResponse(BaseModel):
 # ========= APP FASTAPI =========
 
 app = FastAPI()
-@app.get("/")
-def root():
-    return FileResponse("public/index.html")
 
 app.add_middleware(
     CORSMiddleware,
@@ -198,16 +194,7 @@ def get_orario(
 
 @app.get("/", response_class=HTMLResponse)
 def read_root():
-    """
-    Serviamo static/index.html alla root.
-    """
-    index_path = Path("static/index.html")
+    index_path = Path("public/index.html")
     if not index_path.exists():
-        return HTMLResponse(
-            "<h1>Manca static/index.html</h1>", status_code=500
-        )
+        return HTMLResponse("<h1>Manca public/index.html</h1>", status_code=500)
     return index_path.read_text(encoding="utf-8")
-
-
-# Serviamo gli asset statici (CSS/JS/icone) sotto /static
-app.mount("/static", StaticFiles(directory="static"), name="static")
