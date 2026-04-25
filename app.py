@@ -189,8 +189,3 @@ def get_orario(
     )
 
 
-# ========= FRONTEND =========
-@app.get("/", include_in_schema=False)
-def read_root():
-    # reindirizza alla versione statica servita da Vercel
-    return RedirectResponse(url="/index.html")
