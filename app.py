@@ -5,7 +5,7 @@ from typing import List
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from pydantic import BaseModel
 
 # ========= CONFIG =========
@@ -190,12 +190,7 @@ def get_orario(
 
 
 # ========= FRONTEND =========
-
-BASE_DIR = Path(__file__).resolve().parent
-
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", include_in_schema=False)
 def read_root():
-    index_path = BASE_DIR / "public" / "index.html"
-    if not index_path.exists():
-        return HTMLResponse("<h1>Manca public/index.html</h1>", status_code=500)
-    return index_path.read_text(encoding="utf-8")
+    # reindirizza alla versione statica servita da Vercel
+    return RedirectResponse(url="/index.html")
