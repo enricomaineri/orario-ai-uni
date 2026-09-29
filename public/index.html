@@ -141,6 +141,7 @@
     .lesson-tags { display:flex; align-items:center; justify-content:space-between; gap:6px; margin-top:11px; }
     .source-tag, .track-tag { display:inline-flex; align-items:center; min-height:21px; padding:3px 7px; border-radius:7px; font-size:9px; line-height:1; font-weight:800; white-space:nowrap; }
     .source-tag { color:var(--muted); background:var(--surface); border:1px solid var(--line); }
+    .source-tag svg { width:12px; height:12px; flex:none; }
     .track-tag { color:#59645f; background:rgba(135,144,139,.15); }
     .track1 .track-tag { color:#31578c; background:rgba(118,168,255,.2); }
     [data-theme="dark"] .track-tag { color:#dae2db; }
@@ -388,6 +389,9 @@
       } catch (error) {
         console.error(error);
         state.lessons = [];
+        state.sourceStatus = { Bicocca: 'non disponibile', Statale: 'non disponibile' };
+        $('bicoccaStatus').classList.add('down');
+        $('stataleStatus').classList.add('down');
         $('scheduleGrid').innerHTML = `<div class="empty-state">Non riesco a raggiungere le agende in questo momento.<br><span style="font-size:12px">${escapeHtml(error.message)}</span></div>`;
         setStatus('Collegamento temporaneamente non disponibile. Riprova tra poco.', true);
       } finally {
