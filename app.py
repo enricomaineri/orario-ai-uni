@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 
@@ -222,3 +223,11 @@ def get_orario(
         lessons=lessons,
     )
 
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+app.mount("/", StaticFiles(directory="public", html=True), name="public")
