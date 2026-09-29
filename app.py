@@ -1,191 +1,224 @@
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import List
+from datetime import date, datetime, timedelta
+import re
+from typing import Literal
+import unicodedata
+from zoneinfo import ZoneInfo
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel
 
-# ========= CONFIG =========
 
-DAY_NAMES = [
-    "lunedì",
-    "martedì",
-    "mercoledì",
-    "giovedì",
-    "venerdì",
-    "sabato",
-    "domenica",
-]
+# Third year, first semester 2026/27. Both feeds remain live: only the
+# university schedule APIs supply dates, times, and rooms.
+ACADEMIC_YEAR = "2026"
+UNIMIB_URL = "https://gestioneorari.didattica.unimib.it/PortaleStudentiUnimib/grid_call.php"
+UNIMI_URL = "https://orari-be.divsi.unimi.it/AgendaWeb/Orario/grid_call.php"
+ROME = ZoneInfo("Europe/Rome")
+DAY_NAMES = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì"]
 
-GRID_CALL_URL = (
-    "https://gestioneorari.didattica.unimib.it/PortaleStudentiUnimib/grid_call.php"
-)
-
-# ========= MODELLI =========
+SOURCES = {
+    "Bicocca": {
+        "weekdays": {1, 3},
+        "courses": ("statistical modelling", "statistical modeling", "information retrieval and recommender systems"),
+        "blue_courses": ("information retrieval and recommender systems",),
+    },
+    "Statale": {
+        "weekdays": {0, 2, 4},
+        "courses": ("brain modelling", "brain modeling", "data mining and knowledge extraction"),
+        "blue_courses": ("data mining and knowledge extraction",),
+    },
+}
 
 
 class Lesson(BaseModel):
-    day: str        # "lunedì"
-    date: str       # "27/04"
-    start: str      # "08:30"
-    end: str        # "11:30"
+    day: str
+    date: str
+    start: str
+    end: str
     name: str
     room: str
+    institution: Literal["Bicocca", "Statale"]
+    track: Literal["all", "track1"]
     cancelled: bool
 
 
 class OrarioResponse(BaseModel):
     course_code: str
     course_title: str
-    week_label: str        # "27-04-2026"
-    updated_at: str | None
-    lessons: List[Lesson]
+    week_label: str
+    updated_at: str
+    source_status: dict[str, str]
+    lessons: list[Lesson]
 
 
-# ========= APP FASTAPI =========
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],           # in produzione restringi al tuo dominio
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class ScheduleSourceError(Exception):
+    pass
 
 
-# ========= FUNZIONI DI SUPPORTO =========
+app = FastAPI(title="Orario AI interateneo")
 
 
-def parse_lessons_from_json(data: dict) -> list[Lesson]:
-    """
-    Converte il JSON di grid_call.php in una lista di Lesson.
-    Usa il campo 'celle', che contiene una voce per ogni lezione.
-    """
-    celle = data.get("celle", [])
-    lessons: list[Lesson] = []
+def normalize(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value.casefold())
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    return re.sub(r"[^a-z0-9]+", " ", value).strip()
 
-    for cell in celle:
-        tipo = (cell.get("tipo") or "").strip()
-        # Consideriamo solo le lezioni vere e proprie
-        if tipo and tipo.lower() != "lezione":
-            continue
 
-        nome = (cell.get("nome_insegnamento") or "").strip()
-        aula = (cell.get("aula") or "").strip() or "Aula non indicata"
-        nome_giorno = (cell.get("nome_giorno") or "").strip().lower()
-        data_str = cell.get("data") or ""
-        ora_inizio = (cell.get("ora_inizio") or "").strip()
-        ora_fine = (cell.get("ora_fine") or "").strip()
-        annullato_flag = (cell.get("Annullato") or "0").strip()
-
-        cancelled = annullato_flag == "1"
-
-        if not nome or not nome_giorno or not data_str or not ora_inizio or not ora_fine:
-            continue
-
-        # data nel formato "dd-mm-yyyy" -> "dd/mm"
+def parse_date(value: str) -> date | None:
+    for date_format in ("%d-%m-%Y", "%Y-%m-%d"):
         try:
-            d = datetime.strptime(data_str, "%d-%m-%Y").date()
-            date_label = d.strftime("%d/%m")
-        except ValueError:
-            date_label = data_str
+            return datetime.strptime(value, date_format).date()
+        except (TypeError, ValueError):
+            continue
+    return None
 
+
+def clean_time(value: str) -> str:
+    match = re.match(r"\s*(\d{1,2}:\d{2})", value or "")
+    return match.group(1).zfill(5) if match else ""
+
+
+def is_selected_lesson(name: str, source: str) -> bool:
+    normalized_name = normalize(name)
+    return any(normalize(alias) in normalized_name for alias in SOURCES[source]["courses"])
+
+
+def parse_source_lessons(data: dict, source: Literal["Bicocca", "Statale"]) -> list[Lesson]:
+    lessons = []
+    source_config = SOURCES[source]
+
+    for cell in data.get("celle", []):
+        name = (cell.get("nome_insegnamento") or cell.get("name_original") or "").strip()
+        if not name or not is_selected_lesson(name, source):
+            continue
+
+        class_date = parse_date(cell.get("data", ""))
+        if class_date is None or class_date.weekday() not in source_config["weekdays"]:
+            continue
+
+        lesson_type = str(cell.get("tipo") or "lezione").strip().casefold()
+        if lesson_type and lesson_type != "lezione":
+            continue
+
+        start = clean_time(cell.get("ora_inizio", ""))
+        end = clean_time(cell.get("ora_fine", ""))
+        if not start or not end:
+            time_range = (cell.get("orario") or "").split("-")
+            if len(time_range) == 2:
+                start, end = clean_time(time_range[0]), clean_time(time_range[1])
+        if not start or not end:
+            continue
+
+        blue = any(normalize(alias) in normalize(name) for alias in source_config["blue_courses"])
         lessons.append(
             Lesson(
-                day=nome_giorno,
-                date=date_label,
-                start=ora_inizio,
-                end=ora_fine,
-                name=nome,
-                room=aula,
-                cancelled=cancelled,
+                day=DAY_NAMES[class_date.weekday()],
+                date=class_date.strftime("%d/%m"),
+                start=start,
+                end=end,
+                name=name,
+                room=(cell.get("aula") or "").strip() or "Aula non indicata",
+                institution=source,
+                track="track1" if blue else "all",
+                cancelled=str(cell.get("Annullato", "0")).strip() == "1",
             )
         )
 
-    lessons.sort(key=lambda x: (DAY_NAMES.index(x.day), x.start))
     return lessons
 
 
-# ========= ENDPOINT API =========
+def fetch_bicocca(monday: date) -> list[Lesson]:
+    payload = {
+        "view": "easycourse",
+        "include": "corso",
+        "txtcurr": "3 - PERCORSO COMUNE",
+        "anno": ACADEMIC_YEAR,
+        "corso": "E311PV",
+        "anno2[]": "GGG|3",
+        "_lang": "it",
+        "highlighted_date": "0",
+        "all_events": "0",
+        "date": monday.strftime("%d-%m-%Y"),
+        "ar_codes": "",
+        "ar_select": "",
+    }
+    try:
+        response = requests.post(UNIMIB_URL, data=payload, timeout=18)
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as error:
+        raise ScheduleSourceError(f"Bicocca: {error}") from error
+    return parse_source_lessons(data, "Bicocca")
+
+
+def fetch_statale(monday: date) -> list[Lesson]:
+    params = {
+        "view": "easycourse",
+        "include": "corso",
+        "anno": ACADEMIC_YEAR,
+        "corso": "F3A",
+        "anno2[]": "F3A-0|3",
+        "txtcurr": "3 - Unico",
+        "_lang": "it",
+        "all_events": "0",
+        "date": monday.strftime("%d-%m-%Y"),
+        "ar_codes": "",
+        "ar_select": "",
+    }
+    try:
+        response = requests.get(UNIMI_URL, params=params, timeout=18)
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as error:
+        raise ScheduleSourceError(f"Statale: {error}") from error
+    return parse_source_lessons(data, "Statale")
+
+
+def format_week(monday: date) -> str:
+    friday = monday + timedelta(days=4)
+    if monday.month == friday.month:
+        return f"{monday.day:02d}/{monday.month:02d} – {friday.day:02d}/{friday.month:02d}/{friday.year}"
+    return f"{monday.day:02d}/{monday.month:02d} – {friday.day:02d}/{friday.month:02d}/{friday.year}"
 
 
 @app.get("/api/orario", response_model=OrarioResponse)
 def get_orario(
-    date: str | None = Query(None, description="dd-mm-yyyy; se vuoto usa oggi")
+    response: Response,
+    date_param: str | None = Query(None, alias="date", description="dd-mm-yyyy; default: oggi"),
 ):
-    """
-    Restituisce l'orario del corso E311PV per la settimana che contiene 'date'.
-    Se 'date' è omessa, usa la data di oggi.
-    """
-    if date is None:
-        today = datetime.today().date()
+    """Unisce le lezioni selezionate dai feed live delle due università."""
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    if date_param is None:
+        selected_date = datetime.now(ROME).date()
     else:
+        selected_date = parse_date(date_param)
+        if selected_date is None:
+            raise HTTPException(status_code=400, detail="Formato data atteso: dd-mm-yyyy")
+
+    monday = selected_date - timedelta(days=selected_date.weekday())
+    source_status: dict[str, str] = {}
+    lessons: list[Lesson] = []
+    failures: list[str] = []
+
+    for source, fetch in (("Bicocca", fetch_bicocca), ("Statale", fetch_statale)):
         try:
-            today = datetime.strptime(date, "%d-%m-%Y").date()
-        except ValueError:
-            raise HTTPException(
-                status_code=400, detail="Formato data atteso: dd-mm-yyyy"
-            )
+            lessons.extend(fetch(monday))
+            source_status[source] = "aggiornato"
+        except ScheduleSourceError as error:
+            source_status[source] = "non disponibile"
+            failures.append(str(error))
 
-    # lunedì della settimana della data richiesta
-    weekday = today.weekday()  # lun = 0
-    monday = today - timedelta(days=weekday)
-    date_str = monday.strftime("%d-%m-%Y")
+    if len(failures) == len(source_status):
+        raise HTTPException(status_code=502, detail="; ".join(failures))
 
-    # payload copiato da Network → Form Data per grid_call.php
-    payload = {
-        "view": "easycourse",
-        "include": "corso",
-        "txtcurr": "2 - PERCORSO COMUNE",
-        "anno": "2025",
-        "corso": "E311PV",
-        "anno2[]": "GGG|2",
-        "_lang": "it",
-        "highlighted_date": "0",
-        "all_events": "0",
-        "date": date_str,
-        "ar_codes": "",
-        "ar_select": "",
-    }
-
-    try:
-        r = requests.post(GRID_CALL_URL, data=payload, timeout=15)
-    except requests.RequestException as e:
-        raise HTTPException(
-            status_code=502, detail=f"Errore nel contattare EasyCourse: {e}"
-        )
-
-    if r.status_code != 200:
-        raise HTTPException(
-            status_code=502, detail=f"EasyCourse ha risposto {r.status_code}"
-        )
-
-    try:
-        data = r.json()
-    except ValueError:
-        raise HTTPException(
-            status_code=502, detail="Risposta EasyCourse non valida (JSON)"
-        )
-
-    # meta base dalla testata JSON
-    week_label = data.get("first_day", date_str)
-    course_code = data.get("cds", "E311PV")
-    course_title = f"{course_code} - Artificial Intelligence"
-    updated_at = None  # JSON non sembra includere un campo aggiornamento
-
-    lessons = parse_lessons_from_json(data)
-
+    lessons.sort(key=lambda item: (DAY_NAMES.index(item.day), item.start, item.institution))
     return OrarioResponse(
-        course_code=course_code,
-        course_title=course_title,
-        week_label=week_label,
-        updated_at=updated_at,
+        course_code="E311PV · F3A",
+        course_title="Artificial Intelligence · terzo anno",
+        week_label=format_week(monday),
+        updated_at=datetime.now(ROME).isoformat(timespec="minutes"),
+        source_status=source_status,
         lessons=lessons,
     )
-
 
